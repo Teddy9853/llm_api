@@ -2,43 +2,106 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from pydantic.config import ConfigDict
 from openai import OpenAI
+import uuid
 
 app = FastAPI()
 
 client = OpenAI()  # reads OPENAI_API_KEY from environment
 
+# In-memory session storage
+sessions = {}
 
-class PromptRequest(BaseModel):
-    # Step 10: strip whitespace automatically
+# =========================
+# Models
+# =========================
+
+class SessionResponse(BaseModel):
+    session_id: str
+
+
+class ChatRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    # Step 10: enforce non-empty prompt
-    prompt: str = Field(min_length=1)
+    session_id: str
+    message: str = Field(min_length=1, max_length=1000)
 
+
+class ChatResponse(BaseModel):
+    response: str
+    turn_count: int
+
+
+# =========================
+# Basic Root (keep from your version)
+# =========================
 
 @app.get("/")
 def root():
-    return {"message": "Hello from FastAPI"}
+    return {"message": "Conversational LLM API Running"}
 
 
-@app.post("/hello")
-def hello(req: PromptRequest):
+# =========================
+# Create Session Endpoint
+# =========================
+
+@app.post("/session", response_model=SessionResponse)
+def create_session():
+    session_id = str(uuid.uuid4())
+
+    # Initialize conversation with system prompt
+    sessions[session_id] = [
+        {
+            "role": "system",
+            "content": "You are a helpful CS teaching assistant. Give concise explanations."
+        }
+    ]
+
+    return {"session_id": session_id}
+
+
+# =========================
+# Chat Endpoint
+# =========================
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+
+    # Validate session exists
+    if req.session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Invalid session_id")
+
     try:
-        # LLM call
+        history = sessions[req.session_id]
+
+        # Append user message
+        history.append({
+            "role": "user",
+            "content": req.message
+        })
+
+        # Send full conversation to LLM
         response = client.responses.create(
             model="gpt-5.2",
-            input=req.prompt,
+            input=history
         )
 
-        # Extract model text output
-        llm_text = response.output_text
+        # Extract text
+        assistant_text = response.output_text
+
+        # Append assistant reply
+        history.append({
+            "role": "assistant",
+            "content": assistant_text
+        })
+
+        # Count turns (excluding system)
+        turn_count = len(history) - 1
 
         return {
-            "input": req.prompt,
-            "llm_output": llm_text,
+            "response": assistant_text,
+            "turn_count": turn_count
         }
 
     except Exception as e:
-        # Step 11: log internally, but don't expose details to clients
         print("LLM ERROR:", repr(e))
         raise HTTPException(status_code=500, detail="LLM request failed")
