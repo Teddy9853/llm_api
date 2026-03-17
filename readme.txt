@@ -73,3 +73,51 @@ Possibly index by user ID instead of only session ID.
 Implement cleanup policies (TTL, expiration).
 
 Using a database makes the system production-ready and scalable.
+
+
+7. Why does grounding reduce hallucinations?
+Grounding reduces hallucinations because the model is forced to base its answer on retrieved, relevant documents instead of relying only on its internal training data. By providing explicit context, the model has concrete evidence to reference, which limits its tendency to generate unsupported or fabricated information.
+
+
+8. How do chunk size and overlap affect retrieval quality?
+Chunk size controls how much information is stored in each embedding:
+
+Small chunks → more precise retrieval but may lose context.
+Large chunks → better context but can include irrelevant information.
+
+Overlap helps preserve continuity between chunks:
+No overlap → important information may be split across chunks and missed.
+With overlap → improves recall by ensuring related content appears in multiple chunks.
+
+The best setup balances precision (small chunks) and context (overlap).
+
+
+9. What is the difference between semantic search and keyword search?
+
+Keyword search matches exact words or phrases. It fails if different wording is used.
+Semantic search uses embeddings to understand meaning and intent, retrieving relevant results even if the exact words differ.
+
+Example:
+
+Query: “function calling itself”
+Keyword search might fail if “recursion” isn’t present
+Semantic search can still retrieve relevant content about recursion
+
+
+10. What are common failure modes of RAG systems?
+
+Common issues include:
+Poor retrieval: irrelevant chunks are selected
+Missing context: important information is not retrieved
+Chunking problems: key ideas split across chunks
+Over-reliance on LLM: model ignores context and hallucinates
+Embedding mismatch: query and document embeddings don’t align well
+
+
+11. Why are citations important in AI systems?
+
+Citations provide transparency and trust. They allow users to:
+Verify where the answer came from
+Check correctness of the information
+Understand the reasoning behind the response
+They also help debug RAG systems by showing whether retrieval worked correctly.
