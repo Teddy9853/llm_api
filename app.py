@@ -1,10 +1,12 @@
-from typing import Dict, List, Optional
+from typing import Dict, List
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from pydantic.config import ConfigDict
 from openai import OpenAI
 import math
 import uuid
+import ast
+import json
 
 app = FastAPI()
 
@@ -68,6 +70,26 @@ class ChatResponse(BaseModel):
     turn_count: int
 
 
+class AgentStep(BaseModel):
+    action: str
+    input: str
+    output: str
+
+
+class AgentRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    session_id: str
+    query: str = Field(min_length=1, max_length=1000)
+    max_steps: int = Field(default=5, ge=1, le=10)
+    k: int = Field(default=4, ge=1, le=10)
+
+
+class AgentResponse(BaseModel):
+    answer: str
+    steps: List[AgentStep]
+
+
 # =========================
 # Config
 # =========================
@@ -77,6 +99,77 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
 
+AGENT_SYSTEM_PROMPT = """
+You are a helpful CS teaching assistant and tool-using agent.
+
+You may answer directly when the question is simple and does not require tools.
+
+You must use:
+- calculator for arithmetic or numeric computation
+- kb_search for questions that depend on ingested documents
+- both tools for mixed questions that need both math and document knowledge
+
+Rules:
+- Do not make up facts.
+- If knowledge is not in the KB, say so.
+- Prefer concise answers.
+- Maintain multi-step reasoning by using tools when needed.
+- When enough information is available, produce a final answer for the user.
+""".strip()
+
+ALLOWED_AST_NODES = (
+    ast.Expression,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.USub,
+    ast.UAdd,
+    ast.Constant,
+)
+
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "name": "calculator",
+        "description": "Evaluate a basic arithmetic expression. Use this for math questions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "Arithmetic expression using +, -, *, /, and parentheses"
+                }
+            },
+            "required": ["expression"],
+            "additionalProperties": False
+        }
+    },
+    {
+        "type": "function",
+        "name": "kb_search",
+        "description": "Search the ingested knowledge base for relevant chunks.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query for the knowledge base"
+                },
+                "k": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Number of chunks to retrieve"
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False
+        }
+    }
+]
 
 # =========================
 # Helpers
@@ -198,6 +291,56 @@ def build_grounded_messages(history: List[dict], retrieved_chunks: List[dict], u
     ]
 
 
+def safe_eval_arithmetic(expression: str) -> float:
+    if not expression or len(expression) > 100:
+        raise ValueError("Invalid expression length")
+
+    allowed_chars = set("0123456789+-*/(). ")
+    if any(ch not in allowed_chars for ch in expression):
+        raise ValueError("Expression contains invalid characters")
+
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        raise ValueError("Invalid arithmetic syntax")
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ALLOWED_AST_NODES):
+            raise ValueError("Unsupported operation in expression")
+        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
+            raise ValueError("Only numeric constants are allowed")
+
+    result = eval(compile(tree, filename="<calc>", mode="eval"), {"__builtins__": {}}, {})
+
+    if not isinstance(result, (int, float)):
+        raise ValueError("Expression did not produce a numeric result")
+
+    return result
+
+
+def calculator_tool(expression: str) -> str:
+    value = safe_eval_arithmetic(expression)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def kb_search_tool(query: str, k: int = 4) -> List[dict]:
+    return retrieve_top_k(query, k)
+
+
+def format_kb_results(results: List[dict]) -> str:
+    if not results:
+        return "No relevant KB results found."
+
+    lines = []
+    for item in results:
+        lines.append(
+            f"[{item['chunk_id']} | doc={item['doc_id']} | score={item['score']:.4f}]\n{item['text']}"
+        )
+    return "\n\n".join(lines)
+
+
 # =========================
 # Routes
 # =========================
@@ -296,23 +439,19 @@ def chat(req: ChatRequest):
     try:
         history = sessions[req.session_id]
 
-        # Step 1: retrieve top-k chunks using the current message
         retrieved_chunks = retrieve_top_k(req.message, req.k)
 
-        # Step 2: build grounded prompt with context + conversation history
         grounded_messages = build_grounded_messages(
             history=history,
             retrieved_chunks=retrieved_chunks,
             user_message=req.message
         )
 
-        # Step 3: save user message in session history
         history.append({
             "role": "user",
             "content": req.message
         })
 
-        # Step 4: call LLM
         response = client.responses.create(
             model=CHAT_MODEL,
             input=grounded_messages
@@ -320,13 +459,11 @@ def chat(req: ChatRequest):
 
         assistant_text = response.output_text
 
-        # Step 5: save assistant reply
         history.append({
             "role": "assistant",
             "content": assistant_text
         })
 
-        # Count turns excluding the original system prompt
         turn_count = len(history) - 1
 
         return {
@@ -346,3 +483,112 @@ def chat(req: ChatRequest):
     except Exception as e:
         print("CHAT ERROR:", repr(e))
         raise HTTPException(status_code=500, detail="Chat request failed")
+
+
+@app.post("/agent", response_model=AgentResponse)
+def agent(req: AgentRequest):
+    if req.session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Invalid session_id")
+
+    if not chunks_store:
+        raise HTTPException(status_code=400, detail="No documents have been ingested yet")
+
+    history = sessions[req.session_id]
+    steps: List[dict] = []
+
+    try:
+        messages: List[dict] = [
+            {"role": "system", "content": AGENT_SYSTEM_PROMPT}
+        ]
+
+        for msg in history:
+            if msg["role"] != "system":
+                messages.append(msg)
+
+        messages.append({"role": "user", "content": req.query})
+
+        for _ in range(req.max_steps):
+            response = client.responses.create(
+                model=CHAT_MODEL,
+                input=messages,
+                tools=AGENT_TOOLS
+            )
+
+            response_items = getattr(response, "output", [])
+            function_calls = [item for item in response_items if item.type == "function_call"]
+
+            if not function_calls:
+                final_answer = response.output_text.strip()
+
+                history.append({"role": "user", "content": req.query})
+                history.append({"role": "assistant", "content": final_answer})
+
+                return {
+                    "answer": final_answer,
+                    "steps": steps
+                }
+
+            messages.extend(response.output)
+
+            for call in function_calls:
+                tool_name = call.name
+
+                try:
+                    args = json.loads(call.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+
+                if tool_name == "calculator":
+                    expression = str(args.get("expression", "")).strip()
+                    tool_output = calculator_tool(expression)
+
+                    steps.append({
+                        "action": "calculator",
+                        "input": expression,
+                        "output": tool_output
+                    })
+
+                elif tool_name == "kb_search":
+                    search_query = str(args.get("query", "")).strip()
+                    search_k = int(args.get("k", req.k))
+                    search_k = max(1, min(search_k, 10))
+
+                    results = kb_search_tool(search_query, search_k)
+                    tool_output = format_kb_results(results)
+
+                    steps.append({
+                        "action": "kb_search",
+                        "input": search_query,
+                        "output": tool_output
+                    })
+
+                else:
+                    tool_output = "Unsupported tool"
+
+                    steps.append({
+                        "action": tool_name,
+                        "input": json.dumps(args),
+                        "output": tool_output
+                    })
+
+                messages.append({
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": tool_output
+                })
+
+        fallback_answer = "I could not complete the agent workflow within the step limit."
+
+        history.append({"role": "user", "content": req.query})
+        history.append({"role": "assistant", "content": fallback_answer})
+
+        return {
+            "answer": fallback_answer,
+            "steps": steps
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("AGENT ERROR:", repr(e))
+        raise HTTPException(status_code=500, detail="Agent request failed")
